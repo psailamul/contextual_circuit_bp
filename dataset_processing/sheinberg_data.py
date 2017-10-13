@@ -66,8 +66,8 @@ class data_processing(object):
         self.name = 'sheinberg_data'
         self.config = Config()
         self.output_size = [1, 1]
-        self.im_size = [1, 1]
-        self.model_input_image_size = [1, 1]
+        self.im_size = [192, 256, 3]
+        self.model_input_image_size = [192, 256, 3]
         self.default_loss_function = 'l2'
         self.score_metric = 'l2'
         self.preprocess = [None]
@@ -78,17 +78,18 @@ class data_processing(object):
         self.save_npys = True
         # Recording starts 200msec before onset.
         # Target is 50 - 150ms. = 270 - 370.
+        self.dates = 1
         self.spike_range = [250, 350]
         self.resize = [192, 256]
         self.folds = {
             'train': 'train',
             'test': 'test'}
         self.targets = {
-            'image': tf_fun.float_feature,
+            'image': tf_fun.bytes_feature,
             'label': tf_fun.float_feature
         }
         self.tf_dict = {
-            'image': tf_fun.fixed_len_feature(dtype='float'),
+            'image': tf_fun.fixed_len_feature(dtype='string'),
             'label': tf_fun.fixed_len_feature(dtype='float')
         }
         self.tf_reader = {
@@ -103,22 +104,39 @@ class data_processing(object):
         }
 
     def get_data(self):
+        """Process all data into TFrecords and npzs."""
+        # # First process the RFs
+        # rf_files = glob(
+        #     os.path.join(
+        #         self.config.data_root,
+        #         self.name,
+        #         'spot*.mat'))
+        # channels = {}
+        # for f in tqdm(
+        #         rf_files,
+        #         total=len(rf_files),
+        #         desc='Processing Sheinberg RFs'):
+        #     data = loadmat(f)['data']
+
+        #     import ipdb;ipdb.set_trace()
+
+        # Then process neural data and scenes
         neural_files = glob(
             os.path.join(
                 self.config.data_root,
                 self.name,
                 'scene*.mat'))
-        rf_files = glob(
-            os.path.join(
-                self.config.data_root,
-                self.name,
-                'spot*.mat'))
         scene_images = glob(
             os.path.join(
                 self.config.data_root,
                 self.name,
                 self.im_folder,
                 '*%s' % self.im_ext))
+
+        # Restrict to dates
+        if self.dates is not None:
+            neural_files = neural_files[:self.dates]
+            scene_images = scene_images[:self.dates]
         scene_labels = np.asarray(
             [x.split('/')[-1].split(self.im_ext)[0]
                 for x in scene_images])
@@ -193,6 +211,9 @@ class data_processing(object):
                 if len(event_data):
                     data_matrix[idx, ch] = np.mean(event_data)
 
+        # Convert data_matrix to list of lists
+        data_matrix = data_matrix.tolist()
+
         # Load and process all images
         all_images = []
         for im in unique_images:
@@ -207,14 +228,15 @@ class data_processing(object):
             all_images += [np.expand_dims(it_image, axis=0)]
         all_images = np.asarray(all_images).squeeze()
 
+        import ipdb;ipdb.set_trace()
         # Split labels/files into training/testing (leave one session out).
         out_files = {  # Images
-            'train': np.concatenate(all_images[:self.val_set], axis=0),
-            'val': np.concatenate(all_images[self.val_set:], axis=0)
+            'train': all_images[:self.val_set],
+            'val': all_images[self.val_set:]
         }
         out_labels = {  # Neural data
-            'train': np.concatenate(data_matrix[:self.val_set], axis=0),
-            'val': np.concatenate(data_matrix[self.val_set:], axis=0)
+            'train': data_matrix[:self.val_set],
+            'val': data_matrix[self.val_set:]
         }
 
         if self.save_npys:

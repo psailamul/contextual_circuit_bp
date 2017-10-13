@@ -66,16 +66,18 @@ class data_processing(object):
         self.name = 'sheinberg_data'
         self.config = Config()
         self.output_size = [1, 1]
-        self.im_size = [1, 1]
-        self.model_input_image_size = [1, 1]
+        self.im_size = [192, 256, 3]
+        self.model_input_image_size = [192, 256, 3]
         self.default_loss_function = 'l2'
         self.score_metric = 'l2'
         self.preprocess = [None]
         self.im_ext = '.jpg'
         self.im_folder = 'scene_images'
         self.neural_data = 'LFP'  # 'spike'
-        self.val_set = -1
+        self.val_set = -76
         self.save_npys = True
+        self.num_channels = 33  # 32 with indexing from 1
+        self.dates = 2
         # Recording starts 200msec before onset.
         # Target is 50 - 150ms. = 270 - 370.
         self.spike_range = [250, 350]
@@ -84,11 +86,11 @@ class data_processing(object):
             'train': 'train',
             'test': 'test'}
         self.targets = {
-            'image': tf_fun.float_feature,
+            'image': tf_fun.bytes_feature,
             'label': tf_fun.float_feature
         }
         self.tf_dict = {
-            'image': tf_fun.fixed_len_feature(dtype='float'),
+            'image': tf_fun.fixed_len_feature(dtype='string'),
             'label': tf_fun.fixed_len_feature(dtype='float')
         }
         self.tf_reader = {
@@ -108,17 +110,17 @@ class data_processing(object):
                 self.config.data_root,
                 self.name,
                 'scene*.mat'))
-        rf_files = glob(
-            os.path.join(
-                self.config.data_root,
-                self.name,
-                'spot*.mat'))
         scene_images = glob(
             os.path.join(
                 self.config.data_root,
                 self.name,
                 self.im_folder,
                 '*%s' % self.im_ext))
+
+        # Restrict to dates
+        if self.dates is not None:
+            neural_files = neural_files[:self.dates]
+            scene_images = scene_images[:self.dates]
         scene_labels = np.asarray(
             [x.split('/')[-1].split(self.im_ext)[0]
                 for x in scene_images])
@@ -134,7 +136,6 @@ class data_processing(object):
             stim_names = data['trial_info']['stim_names']
             it_images = []
             it_labels = []
-            neural_channels = {}
             for st in stim_names:
                 st = st.split('\x00')[0].replace(' ', '')
                 it_images += [st]
@@ -142,59 +143,24 @@ class data_processing(object):
             it_channel_key = np.asarray(data['spike']['channel'])
             it_neural = np.asarray(data['spike']['data'])
             unique_channels = np.unique(it_channel_key)
+            channel_data = np.zeros((len(it_images), self.num_channels))
             for channel in unique_channels:
+                #  Sum up spikes across spike-sorted channels
                 channel_idx = np.where(it_channel_key == channel)[0]
-                proc_it_neural = np.expand_dims(
-                    it_neural[channel_idx].sum(0)[bin_range].sum(0),
-                    axis=-1).astype(np.float32)
-                # Convert proc_it_neural to image-key dict
-                dict_neural = {k: v for k, v in zip(it_images, proc_it_neural)}
-                if channel not in neural_channels.keys():
-                    neural_channels[channel] = dict_neural
-                else:
-                    neural_channels[channel] += dict_neural
+                proc_it_neural = it_neural[channel_idx].sum(
+                    0)[bin_range].sum(0).astype(np.float32)
+                channel_data[:, channel] = proc_it_neural
 
+            print data['trial_info']['date']
             # TODO: Visualize gaussian-smoothed spikes here
             files += [it_images]
             im_labels += [it_labels]
-            labels += [neural_channels]
-
-        # Combine channel data
-        all_channels = np.unique(np.concatenate([x.keys() for x in labels]))
-        full_image_list = []
-        channel_data_list = []
-        for fb, la in zip(files, labels):
-            for idx, f in enumerate(fb):
-                full_image_list += [f]
-            it_channels = {}
-            for k, v in la.iteritems():
-                it_channels[k] = v
-            channel_data_list += [it_channels]
-
-        # Average neural data across repeated images
-        unique_images = np.unique(full_image_list)
-
-        # Initialize data matrix with + 1 the size of the channels
-        # (indexing starts at 1)
-        data_matrix = np.zeros((len(unique_images), all_channels.max() + 1))
-        for idx, im in enumerate(unique_images):
-            # Loop through channels
-            for ch in all_channels:
-                # Then loop through sessions in channel_data_list
-                event_data = []
-                for session in channel_data_list:
-                    if ch in session.keys():
-                        # If the queried channel was recorded in the session
-                        it_session = session[ch]
-                        if im in it_session.keys():
-                            # If the image was shown in this session
-                            event_data += [it_session[im]]
-                # Store average response for each stimulus
-                if len(event_data):
-                    data_matrix[idx, ch] = np.mean(event_data)
+            labels += [channel_data]
 
         # Load and process all images
-        all_images = []
+        cat_files = np.concatenate(files)
+        unique_images = np.unique(cat_files)
+        all_images = {}
         for im in unique_images:
             it_image = misc.imread(
                 os.path.join(
@@ -204,18 +170,40 @@ class data_processing(object):
                     '%s%s' % (im, self.im_ext)))
             if self.resize is not None:
                 it_image = misc.imresize(it_image, self.resize)
-            all_images += [np.expand_dims(it_image, axis=0)]
-        all_images = np.asarray(all_images).squeeze()
-        import ipdb;ipdb.set_trace()
+            all_images[im] = np.expand_dims(it_image, axis=0)
+
+        # Slice an image array
+        sliced_images = []
+        for im in cat_files:
+            sliced_images += [all_images[im]]
+
+        # Prepare data and build up extra regressors for linear model
+        data_matrix = np.concatenate(labels, axis=0)
+        run_idx = np.concatenate([
+            np.zeros((len(f))) for f in files])
+
+        # Create across-session stimulus normalized data
+        im_means = {}
+        for im in unique_images:
+            try:
+                mask = np.asarray(im) == cat_files
+                im_means[im] = data_matrix[mask, :].mean(0)
+            except:
+                import ipdb; ipdb.set_trace()
+
+        across_session_data_matrix = []
+        for idx, im in enumerate(cat_files):
+            across_session_data_matrix += [data_matrix[idx] - im_means[im]]
+        across_session_data_matrix = np.asarray(across_session_data_matrix)
 
         # Split labels/files into training/testing (leave one session out).
         out_files = {  # Images
-            'train': np.concatenate(all_images[:self.val_set], axis=0),
-            'val': np.concatenate(all_images[self.val_set:], axis=0)
+            'train': sliced_images[:self.val_set],
+            'val': sliced_images[self.val_set:]
         }
         out_labels = {  # Neural data
-            'train': np.concatenate(data_matrix[:self.val_set], axis=0),
-            'val': np.concatenate(data_matrix[self.val_set:], axis=0)
+            'train': data_matrix[:self.val_set],
+            'val': data_matrix[self.val_set:]
         }
 
         if self.save_npys:
@@ -226,5 +214,9 @@ class data_processing(object):
             np.savez(
                 out_file,
                 data_matrix=data_matrix,
-                all_images=all_images)
+                across_session_data_matrix=across_session_data_matrix,
+                im_means=im_means,
+                all_images=sliced_images,
+                run_idx=run_idx)
         return out_files, out_labels
+
