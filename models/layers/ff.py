@@ -85,6 +85,25 @@ class ff(object):
             filter_size=filter_size)
         return context, act
 
+    def sep_conv(
+            self,
+            context,
+            act,
+            in_channels,
+            out_channels,
+            filter_size,
+            name,
+            it_dict):
+        """Add a separable 2D convolution layer."""
+        context, act = sep_conv_layer(
+            self=context,
+            bottom=act,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            name=name,
+            filter_size=filter_size)
+        return context, act
+
     def fc(
             self,
             context,
@@ -458,6 +477,45 @@ def conv_layer(
         return self, bias
 
 
+def sep_conv_layer(
+        self,
+        bottom,
+        out_channels,
+        name,
+        in_channels=None,
+        filter_size=3,
+        stride=[1, 1, 1, 1],
+        padding='SAME',
+        multiplier=4,
+        aux=None):
+    """2D convolutional layer."""
+    if aux is not None and 'multiplier' in aux:
+        multiplier = aux['multiplier']
+    with tf.variable_scope(name):
+        if in_channels is None:
+            in_channels = int(bottom.get_shape()[-1])
+        self, dfilt, _ = get_conv_var(
+            self=self,
+            filter_size=filter_size,
+            in_channels=1 * multiplier,
+            out_channels=out_channels,
+            name='d_%s' % name)
+        self, pfilt, conv_biases = get_conv_var(
+            self=self,
+            filter_size=filter_size,
+            in_channels=1 * multiplier,
+            out_channels=out_channels,
+            name='d_%s' % name)
+        conv = tf.nn.separable_conv2d(
+            input=bottom,
+            depthwise_filter=dfilt,
+            pointwise_filt=pfilt,
+            strides=stride,
+            padding=padding)
+        bias = tf.nn.bias_add(conv, conv_biases)
+        return self, bias
+
+
 def conv_3d_layer(
         self,
         bottom,
@@ -576,7 +634,8 @@ def sparse_pool_layer(
     def create_gaussian_rf(xy, h, w):
         """Create a gaussian bump for initializing the spatial weights."""
         # TODO: implement this.
-        pass
+        import ipdb;ipdb.set_trace()
+        raise NotImplementedError
 
     with tf.variable_scope(name):
         bottom_shape = [int(x) for x in bottom.get_shape()]
@@ -606,12 +665,14 @@ def sparse_pool_layer(
             if 'h' in aux.keys():
                 gaussian_h = aux['h']
                 gaussian_w = aux['w']
+                k = aux['k']
             else:
-                gaussian_h, gaussian_w = None, None
+                gaussian_h, gaussian_w, k = None, None, None
             spatial_rf = create_gaussian_rf(
                 xy=gaussian_xy,
                 h=gaussian_h,
-                w=gaussian_w)
+                w=gaussian_w,
+                k=k)
             spatial_weights += spatial_rf
         spatial_sparse = tf.reduce_mean(
             bottom * spatial_weights, reduction_indices=[1, 2])
